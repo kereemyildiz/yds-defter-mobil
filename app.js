@@ -250,13 +250,16 @@ views.review = (arg) => {
   const front = mode === 'tr-en'
     ? `<div class="term tr">${e((i.meanings ?? []).slice(0, 2).map((m) => m.tr).join(' · ') || '(anlam yok)')}</div>${ex ? `<div class="hint">${blankOut(ex.en, w.term)}</div>` : ''}`
     : `<div class="term">${e(w.term)} <button class="icon" data-act="speak" data-text="${e(w.term)}" aria-label="Dinle">🔊</button></div>${w.context ? `<div class="hint">“${highlight(w.context, w.term)}”</div>` : ''}`;
+  // Tap the card to flip it; swipe to move on regardless of flip state; grade from either side.
   const back = r.flipped
     ? `<div class="flip-back">${mode === 'tr-en' ? `<h2>${e(w.term)} <button class="icon" data-act="speak" data-text="${e(w.term)}">🔊</button></h2>` : ''}
-        ${wordInfoHtml(w, { compact: true, footer: false })}${w.note ? `<div class="context">📝 ${e(w.note)}</div>` : ''}</div>${answerButtons(w.srs, 'word')}`
-    : '<button class="btn primary big show" data-act="flip">Cevabı göster</button>';
+        ${wordInfoHtml(w, { compact: true, footer: false })}${w.note ? `<div class="context">📝 ${e(w.note)}</div>` : ''}</div>`
+    : '';
   return `${tabs}<div class="row between"><span class="muted small">${r.idx + 1} / ${r.queue.length} · bugün ${today} tekrar</span>
       <span class="seg small"><a class="${mode === 'en-tr' ? 'on' : ''}" data-act="mode" data-v="en-tr">EN→TR</a><a class="${mode === 'tr-en' ? 'on' : ''}" data-act="mode" data-v="tr-en">TR→EN</a></span></div>
-    <div class="card flash"><div class="front">${front}</div>${back}</div>`;
+    <div class="card flash" ${r.flipped ? '' : 'data-act="flip"'}><div class="front">${front}</div>${back}</div>
+    ${answerButtons(w.srs, 'word')}
+    <p class="muted small swipe-hint">👆 Karta dokun: anlamı gör · 👈 👉 kaydır: geç</p>`;
 };
 
 // ---- notes ----
@@ -553,6 +556,21 @@ const actions = {
   wwhich(el) { pref('wwhich', el.dataset.v); render(); },
   ptab(el) { pref('ptab', el.dataset.v); render(); },
   flip() { state.review.flipped = true; render(); },
+  // Browse the deck without grading — independent of whether the current card is flipped.
+  'r-prev'() {
+    const r = state.review;
+    if (!r || r.idx <= 0) return;
+    r.idx -= 1;
+    r.flipped = false;
+    render();
+  },
+  'r-next'() {
+    const r = state.review;
+    if (!r || r.idx >= r.queue.length) return;
+    r.idx += 1;
+    r.flipped = false;
+    render();
+  },
   'g-start'(el) {
     const scope = el.dataset.scope;
     state.gp = buildSession(scope, el.dataset.limit === 'all' ? 'all' : 10);
@@ -651,6 +669,24 @@ document.addEventListener('change', (ev) => {
   pref(k, ev.target.value);
   render();
 });
+
+// Swipe the flashcard left/right to move through the deck, independent of flip state
+// and without grading — only active on the word review screen.
+let touchX = 0;
+let touchY = 0;
+document.addEventListener('touchstart', (ev) => {
+  const t = ev.touches[0];
+  touchX = t.clientX;
+  touchY = t.clientY;
+}, { passive: true });
+document.addEventListener('touchend', (ev) => {
+  if (state.route[0] !== 'review' || state.route[1] === 'notes' || !state.review) return;
+  const t = ev.changedTouches[0];
+  const dx = t.clientX - touchX;
+  const dy = t.clientY - touchY;
+  if (Math.abs(dx) < 50 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+  actions[dx < 0 ? 'r-next' : 'r-prev']();
+}, { passive: true });
 
 document.addEventListener('submit', async (ev) => {
   if (ev.target.dataset.form !== 'login') return;

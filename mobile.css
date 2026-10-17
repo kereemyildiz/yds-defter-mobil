@@ -95,16 +95,16 @@ button.opt { width: 100%; }
 details summary { color: var(--accent); margin-top: 8px; cursor: pointer; }
 
 /* review */
-.flash { min-height: 52vh; display: flex; flex-direction: column; }
+.flash { min-height: 40vh; display: flex; flex-direction: column; justify-content: center; touch-action: pan-y; }
 .flash .front { text-align: center; padding: 24px 0 12px; }
 .flash .term { font-size: 36px; font-weight: 800; word-break: break-word; }
 .flash .term.tr { font-size: 24px; }
 .flash .hint { color: var(--muted); margin-top: 10px; font-style: italic; }
-.flash .show { margin-top: auto; }
 .flip-back { border-top: 1px dashed var(--border); padding-top: 14px; margin-top: 8px; }
-.answers { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: auto; padding-top: 14px; }
+.answers { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
 .ans { flex-direction: column; justify-content: center; padding: 16px 8px; font-size: 17px; }
 .ans small { color: var(--muted); font-size: 12px; }
+.swipe-hint { text-align: center; margin-top: 10px; }
 .ans.g0 { border-color: var(--bad); }
 .ans.g2 { border-color: var(--good); }
 
