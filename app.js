@@ -27,6 +27,7 @@ const state = {
   sync: { busy: false, error: '' },
   route: [],
   review: null,
+  gp: null, // active practice session (lib/grammar-data.js topics)
   miniQuiz: {},
   login: { busy: false, error: '' },
   prefs: (() => { try { return JSON.parse(localStorage.getItem(PREFS_KEY)) ?? {}; } catch { return {}; } })(),
@@ -47,7 +48,8 @@ const log = () => state.data.log ?? [];
 let saveTimer;
 function save() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => db.set('state', { data: state.data, phone: state.phone, shas: state.shas, syncAt: state.syncAt, dirty }).catch(() => {}), 400);
+  // `gp` (the active practice session) is device-only, like on the computer — never pushed to GitHub.
+  saveTimer = setTimeout(() => db.set('state', { data: state.data, phone: state.phone, shas: state.shas, syncAt: state.syncAt, dirty, gp: state.gp }).catch(() => {}), 400);
 }
 
 // Records a change made on the phone and sends it a few seconds later.
@@ -124,7 +126,7 @@ async function logout(message = '') {
   clearTimeout(pushTimer);
   localStorage.removeItem(TOKEN_KEY);
   await db.clear().catch(() => {});
-  Object.assign(state, { token: null, data: {}, phone: {}, shas: {}, syncAt: 0, review: null });
+  Object.assign(state, { token: null, data: {}, phone: {}, shas: {}, syncAt: 0, review: null, gp: null });
   state.login.error = message;
   location.hash = '';
   render();
@@ -273,17 +275,73 @@ views.notes = () => {
     }).join('')}</div>` : '<p class="empty">Not yok.</p>'}`;
 };
 
-// ---- wrong answers ----
+// ---- practice: topics, sessions, wrong answers, starred ----
 
 const meta = () => state.data.qmeta ?? {};
+const prog = () => state.data.gprog ?? {};
 const bank = () => [...STATIC, ...all('q:')].map((q) => ({ ...q, topic: meta()[q.id]?.topic ?? q.topic }));
+const qById = (id) => bank().find((q) => q.id === id);
+const byTopic = (id) => bank().filter((q) => q.topic === id);
+const visibleTopics = (group) => TOPICS.filter((t) => t.group === group && (!t.hidden || bank().some((q) => q.topic === t.id)));
+const starredList = () => bank().filter((q) => meta()[q.id]?.starred).sort((a, b) => (meta()[b.id]?.starredAt ?? 0) - (meta()[a.id]?.starredAt ?? 0));
+
 function wrongList(which, topic) {
-  const P = state.data.gprog ?? {};
+  const P = prog();
   return bank().filter((q) => {
     const p = P[q.id];
     return p && (which === 'now' ? p.c === false : p.n > p.ok) && (!topic || q.topic === topic);
   }).sort((a, b) => P[b.id].at - P[a.id].at);
 }
+
+// never answered first (real exam questions before the rest), then last answered wrong, then oldest
+function ranked(qs) {
+  const P = prog();
+  const score = (q) => (!P[q.id] ? (q.source === 'import' ? 0 : 0.5) : P[q.id].c === false ? 1 : 2 + P[q.id].at / 1e14);
+  return qs.slice().sort((a, b) => score(a) - score(b));
+}
+
+function topicStats(id) {
+  const qs = byTopic(id);
+  let answered = 0; let n = 0; let ok = 0;
+  for (const q of qs) {
+    const p = prog()[q.id];
+    if (p) { answered += 1; n += p.n; ok += p.ok; }
+  }
+  return { total: qs.length, answered, acc: n ? Math.round((ok / n) * 100) : null };
+}
+
+function recordAnswer(qid, correct, picked) {
+  const gprog = { ...prog() };
+  const p = gprog[qid] ?? { n: 0, ok: 0 };
+  gprog[qid] = { n: p.n + 1, ok: p.ok + (correct ? 1 : 0), c: correct, p: picked, at: Date.now() };
+  state.data.gprog = gprog;
+  changed(['gprog']);
+}
+
+// `limit`: how many questions (topic practice); 'all' takes every question of the topic.
+function buildSession(scope, limit = 10) {
+  let qs = [];
+  if (scope === 'starred-q') qs = shuffle(starredList());
+  else if (scope.startsWith('wrong:')) {
+    const [, which, arg] = scope.split(':');
+    qs = which === 'one' ? [qById(arg)].filter(Boolean) : shuffle(wrongList(which, arg));
+  } else qs = shuffle(ranked(byTopic(scope)).slice(0, limit === 'all' ? undefined : limit));
+  // each item keeps its own answer, so you can skip ahead and come back
+  const items = qs.map((q) => ({ id: q.id, picked: null, order: topicById(q.topic)?.fixedOptions ? [0, 1, 2, 3, 4] : shuffle([0, 1, 2, 3, 4]) }));
+  return { scope, items, idx: 0, startedAt: Date.now(), limit };
+}
+
+// device-only, like on the computer: keeps the active session across closing and reopening the app
+const saveGp = () => save();
+// an unfinished session for this exact scope exists — offer to continue it
+const resumable = (scope) => state.gp && state.gp.scope === scope && state.gp.idx < state.gp.items.length;
+
+function scopeTitle(scope) {
+  if (scope.startsWith('wrong:')) return 'Yanlışlarım';
+  if (scope === 'starred-q') return '⭐ Favorilerim';
+  return topicById(scope)?.title ?? scope;
+}
+const exitHref = (scope) => (topicById(scope) ? `#pt/${scope}` : '#practice');
 const examTag = (q) => `${/YDS/.test(q.exam ?? '') ? 'ÖSYM ' : ''}${q.exam ?? 'Çıkmış'}${q.number ? ` · ${q.number}. soru` : ''}`;
 
 function passageHtml(q) {
@@ -311,17 +369,126 @@ function wrongCard(q) {
     ${q.explanation ? `<div class="expl">${e(q.explanation)}</div>` : ''}${ai ? `<div class="expl">✨ ${e(ai)}</div>` : ''}</div>`;
 }
 
-views.wrong = () => {
+function wrongHtml() {
   const which = state.prefs.wwhich ?? 'all';
   const topic = state.prefs.wtopic ?? '';
   const list = wrongList(which, topic);
   const topics = TOPICS.map((t) => [t, wrongList(which, t.id).length]).filter(([, n]) => n);
-  if (!wrongList('all', '').length) return '<div class="empty"><div class="big">🎯</div><h2>Henüz yanlışın yok</h2><p>Bilgisayarda soru çözdükçe yanlışların burada birikir.</p></div>';
-  return `<div class="seg"><a class="${which === 'all' ? 'on' : ''}" data-act="wwhich" data-v="all">Hepsi (${wrongList('all', topic).length})</a>
+  if (!wrongList('all', '').length) return '<div class="empty"><div class="big">🎯</div><h2>Henüz yanlışın yok</h2><p>Soru çözdükçe yanlışların burada birikir.</p></div>';
+  return `<p><button class="btn primary grow" data-act="g-start" data-scope="wrong:all:" style="width:100%">▶ Hepsini tekrar çöz (${wrongList('all').length})</button></p>
+    <div class="seg"><a class="${which === 'all' ? 'on' : ''}" data-act="wwhich" data-v="all">Hepsi (${wrongList('all', topic).length})</a>
       <a class="${which === 'now' ? 'on' : ''}" data-act="wwhich" data-v="now">Hâlâ yanlış (${wrongList('now', topic).length})</a></div>
     <div class="row"><select data-change="wtopic" class="grow"><option value="">Tüm konular</option>
       ${topics.map(([t, n]) => `<option value="${t.id}" ${t.id === topic ? 'selected' : ''}>${e(t.title)} (${n})</option>`).join('')}</select></div>
     ${list.map(wrongCard).join('') || '<p class="empty">Bu filtrede soru yok.</p>'}`;
+}
+
+function starredCardHtml(q) {
+  const t = topicById(q.topic);
+  const stem = /^\(\d+\)$/.test(q.stem) ? `<b>${q.stem}</b> numaralı boşluk` : e(q.stem).replace(/-{3,}/g, '<span class="blank">––––</span>').replace(/\n/g, '<br>');
+  const opts = q.options.map((o, i) => `<div class="opt ${i === q.answer ? 'right' : 'dim'}"><b>${LETTERS[i]})</b> ${e(o)}${i === q.answer ? ' ✅' : ''}</div>`).join('');
+  return `<div class="card wcard">
+    <div class="wmeta">${q.source === 'import' ? `<span class="chip st-mastered">📘 ${e(examTag(q))}</span>` : '<span class="chip">Örnek</span>'}
+      ${t ? `<span class="chip">${t.icon} ${e(t.title)}</span>` : ''}
+      <button class="icon" data-act="g-star" data-id="${q.id}" aria-label="Favoriden çıkar">★</button></div>
+    ${q.passage ? (q.passage.length > 300 ? `<details><summary>Paragrafı göster</summary>${passageHtml(q)}</details>` : passageHtml(q)) : ''}
+    <div class="stem">${stem}</div><div class="opts">${opts}</div>
+    ${q.explanation ? `<div class="expl">${e(q.explanation)}</div>` : ''}</div>`;
+}
+
+function starredHtml() {
+  const list = starredList();
+  if (!list.length) return '<div class="empty"><div class="big">⭐</div><h2>Henüz favori sorun yok</h2><p>Bir soruyu çözerken ★ ikonuna basarsan burada birikir.</p></div>';
+  return `<p><button class="btn primary grow" data-act="g-start" data-scope="starred-q" style="width:100%">▶ Favorileri çöz (${list.length})</button></p>
+    ${list.map(starredCardHtml).join('')}`;
+}
+
+function topicRow(t) {
+  const st = topicStats(t.id);
+  const pct = st.total ? Math.round((st.answered / st.total) * 100) : 0;
+  return `<li><a href="#pt/${t.id}"><div class="wl-main"><b>${t.icon} ${e(t.title)}</b>
+      <div class="muted wl-mean">${st.answered}/${st.total} çözüldü${st.acc != null ? ` · %${st.acc} doğru` : ''}</div></div>
+    <span class="chip">${pct}%</span></a></li>`;
+}
+
+function practiceTopicsHtml() {
+  return `<h2>Soru Tipleri</h2><ul class="wlist">${visibleTopics('types').map(topicRow).join('')}</ul>
+    <h2>Dilbilgisi</h2><ul class="wlist">${visibleTopics('grammar').map(topicRow).join('')}</ul>`;
+}
+
+views.practice = () => {
+  const tab = state.prefs.ptab ?? 'topics';
+  const seg = `<div class="seg"><a class="${tab === 'topics' ? 'on' : ''}" data-act="ptab" data-v="topics">📚 Konular</a>
+    <a class="${tab === 'wrong' ? 'on' : ''}" data-act="ptab" data-v="wrong">❌ Yanlışlarım</a>
+    <a class="${tab === 'starred' ? 'on' : ''}" data-act="ptab" data-v="starred">⭐ Favoriler</a></div>`;
+  if (tab === 'wrong') return seg + wrongHtml();
+  if (tab === 'starred') return seg + starredHtml();
+  return seg + practiceTopicsHtml();
+};
+
+views.pt = (id) => {
+  const t = topicById(id);
+  if (!t) return '<p class="empty">Konu bulunamadı. <a href="#practice">Konular</a></p>';
+  const st = topicStats(id);
+  const mist = wrongList('now', id);
+  return `<a class="back" href="#practice">← Konular</a>
+    <div class="card">
+      <h1 style="font-size:22px">${t.icon} ${e(t.title)}</h1>
+      <p class="muted small">${st.total} soru · ${st.answered} çözüldü${st.acc != null ? ` · %${st.acc} doğru` : ''}</p>
+      ${resumable(id) ? `<p><a class="btn primary big" href="#pp/${id}">▶ Kaldığın yerden devam et (Soru ${state.gp.idx + 1}/${state.gp.items.length})</a></p>` : ''}
+      <div class="row">
+        <button class="btn ${resumable(id) ? '' : 'primary'} grow" data-act="g-start" data-scope="${id}" ${st.total ? '' : 'disabled'}>▶ ${Math.min(10, st.total)} soru çöz${resumable(id) ? ' (sıfırla)' : ''}</button>
+        ${st.total > 10 ? `<button class="btn" data-act="g-start" data-scope="${id}" data-limit="all">Hepsi (${st.total})</button>` : ''}
+      </div>
+    </div>
+    ${mist.length ? `<h2>Bu konudaki yanlışların (${mist.length})</h2>${mist.slice(0, 8).map(wrongCard).join('')}` : ''}`;
+};
+
+function resultView(g, head, scope) {
+  const results = g.items.filter((x) => x.picked != null);
+  const correct = results.filter((x) => x.picked === qById(x.id)?.answer).length;
+  return `${head}<div class="empty"><div class="big">${results.length && correct === results.length ? '🏆' : '📊'}</div>
+    <h2>${correct} / ${results.length} doğru</h2>
+    <p class="row" style="justify-content:center">
+      <button class="btn primary" data-act="g-restart">Yeniden</button>
+      <a class="btn" href="${exitHref(scope)}">Çık</a></p></div>`;
+}
+
+views.pp = (scope) => {
+  if (!state.gp || state.gp.scope !== scope) state.gp = buildSession(scope);
+  const g = state.gp;
+  const head = `<div class="row between"><h1 style="font-size:20px">${e(scopeTitle(scope))}</h1>
+    <button class="icon" data-act="g-restart" aria-label="Baştan başla" title="Aynı soruları baştan başlat">↻</button></div>`;
+  if (!g.items.length) {
+    return `${head}<div class="empty"><h2>Bu bölümde soru yok.</h2><p><a class="btn" href="${exitHref(scope)}">Geri dön</a></p></div>`;
+  }
+  const item = g.items[g.idx];
+  if (!item) return resultView(g, head, scope);
+  const q = qById(item.id);
+  if (!q) { g.items.splice(g.idx, 1); saveGp(); return views.pp(scope); }
+  const t = topicById(q.topic);
+  const picked = item.picked;
+  const opts = item.order.map((orig, pos) => {
+    let cls = '';
+    if (picked != null) cls = orig === q.answer ? 'right' : orig === picked ? 'wrong' : 'dim';
+    return `<button class="opt ${cls}" data-act="g-pick" data-i="${orig}" ${picked != null ? 'disabled' : ''}><b>${LETTERS[pos]})</b> ${e(q.options[orig])}</button>`;
+  }).join('');
+  const answered = g.items.filter((x) => x.picked != null).length;
+  const stem = /^\(\d+\)$/.test(q.stem) ? `<b>${q.stem}</b> numaralı boşluğa ne gelmeli?` : e(q.stem).replace(/-{3,}/g, '<span class="blank">––––</span>').replace(/\n/g, '<br>');
+  const ai = meta()[q.id]?.aiExplanation;
+  const after = picked != null ? `
+    <div class="expl">${picked === q.answer ? '✅ Doğru! ' : `❌ Doğru cevap: <b>${e(q.options[q.answer])}</b>. `}${e(q.explanation ?? '')}</div>
+    ${ai ? `<div class="expl">✨ ${e(ai)}</div>` : ''}` : '';
+  const nav = `<div class="row between" style="margin-top:14px">
+    <button class="btn" data-act="g-prev" ${g.idx ? '' : 'disabled'}>← Önceki</button>
+    <span class="muted small">${answered}/${g.items.length} cevaplandı</span>
+    ${picked != null ? `<button class="btn primary" data-act="g-next">${g.idx + 1 < g.items.length ? 'Sonraki →' : 'Bitir'}</button>`
+      : `<button class="btn" data-act="g-next">${g.idx + 1 < g.items.length ? 'Atla →' : 'Bitir'}</button>`}</div>`;
+  return `${head}
+    <p class="muted small">Soru ${g.idx + 1} / ${g.items.length} · ${t?.icon ?? ''} ${e(t?.title ?? '')}
+      <button class="icon" data-act="g-star" data-id="${q.id}" aria-label="Favori">${meta()[q.id]?.starred ? '★' : '☆'}</button></p>
+    <div class="card">${q.passage ? passageHtml(q) : ''}<div class="stem">${stem}</div><div class="opts">${opts}</div>${after}</div>
+    ${nav}`;
 };
 
 // ---- settings ----
@@ -357,7 +524,7 @@ function render() {
   state.route = location.hash.slice(1).split('/').filter(Boolean);
   const [view = 'words', arg] = state.route;
   $('#main').innerHTML = (views[view] ?? views.words)(arg);
-  const tab = view === 'w' ? 'words' : view;
+  const tab = view === 'w' ? 'words' : view === 'pt' || view === 'pp' ? 'practice' : view;
   for (const a of document.querySelectorAll('nav.tabs a')) a.classList.toggle('on', a.dataset.tab === tab);
   const badge = $('#dueBadge');
   const due = words().filter((w) => isDue(w.srs)).length + dueNotes().length;
@@ -384,7 +551,42 @@ const actions = {
   filter(el) { pref('filter', el.dataset.v); render(); },
   mode(el) { pref('mode', el.dataset.v); state.review.flipped = false; render(); },
   wwhich(el) { pref('wwhich', el.dataset.v); render(); },
+  ptab(el) { pref('ptab', el.dataset.v); render(); },
   flip() { state.review.flipped = true; render(); },
+  'g-start'(el) {
+    const scope = el.dataset.scope;
+    state.gp = buildSession(scope, el.dataset.limit === 'all' ? 'all' : 10);
+    saveGp();
+    location.hash = `#pp/${scope}`;
+  },
+  // Same questions, same order, just unanswered again — unlike 'g-start', which picks a fresh random set.
+  'g-restart'() {
+    state.gp = { ...state.gp, idx: 0, startedAt: Date.now(), items: state.gp.items.map((x) => ({ ...x, picked: null })) };
+    saveGp();
+    render();
+    window.scrollTo(0, 0);
+  },
+  'g-pick'(el) {
+    const item = state.gp.items[state.gp.idx];
+    if (item.picked != null) return;
+    const q = qById(item.id);
+    item.picked = Number(el.dataset.i);
+    saveGp();
+    recordAnswer(q.id, item.picked === q.answer, item.picked);
+    render();
+  },
+  'g-next'() { state.gp.idx += 1; saveGp(); render(); window.scrollTo(0, 0); },
+  'g-prev'() { state.gp.idx = Math.max(0, state.gp.idx - 1); saveGp(); render(); window.scrollTo(0, 0); },
+  'g-star'(el) {
+    const id = el.dataset.id;
+    const qmeta = { ...meta() };
+    const cur = qmeta[id] ?? {};
+    const on = !cur.starred;
+    qmeta[id] = { ...cur, starred: on, starredAt: on ? Date.now() : cur.starredAt };
+    state.data.qmeta = qmeta;
+    changed(['qmeta']);
+    render();
+  },
   star(el) {
     const w = state.data['w:' + el.dataset.id];
     w.starred = !w.starred;
@@ -485,7 +687,7 @@ document.addEventListener('visibilitychange', () => {
     try {
       const saved = await db.get('state');
       if (saved) {
-        Object.assign(state, { data: saved.data ?? {}, phone: saved.phone ?? {}, shas: saved.shas ?? {}, syncAt: saved.syncAt ?? 0 });
+        Object.assign(state, { data: saved.data ?? {}, phone: saved.phone ?? {}, shas: saved.shas ?? {}, syncAt: saved.syncAt ?? 0, gp: saved.gp ?? null });
         dirty = Boolean(saved.dirty); // changes not sent before the app was closed
       }
     } catch { /* first start or storage blocked: everything comes from GitHub */ }

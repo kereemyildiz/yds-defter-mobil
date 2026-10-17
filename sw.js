@@ -1,6 +1,6 @@
 // Keeps the app shell available offline. Network first, so a new version shows up on the next open;
 // the cached copy is used only without internet. GitHub API calls are never cached here.
-const CACHE = 'yds-defter-20261015062949';
+const CACHE = 'yds-defter-20261017064148';
 
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (ev) => {
